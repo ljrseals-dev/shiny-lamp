@@ -1,0 +1,45 @@
+[project]
+name = "brute-genius"
+version = "0.1.0"
+description = "Exhaustive combinatorial search engine for MCP — try every combination on a fleet."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Brute Genius" }]
+dependencies = [
+    "fastmcp>=2.3.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+gpu = ["torch>=2.3.0"]
+runpod = ["runpod>=1.6.0"]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+brute-genius = "server:mcp.run"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "enumerator",
+    "xpu",
+    "objectives",
+    "provider",
+    "mock_provider",
+    "runpod_provider",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["."]
+pythonpath = ["."]
