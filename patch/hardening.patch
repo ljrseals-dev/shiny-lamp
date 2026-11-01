@@ -1,0 +1,1142 @@
+diff -ruN -x __pycache__ orig/README.md brute-genius/README.md
+--- orig/README.md	2026-11-01 22:12:46.470694591 +0000
++++ brute-genius/README.md	2026-11-01 22:14:57.297617585 +0000
+@@ -1,8 +1,10 @@
+ # Brute Genius
+ 
+-Exhaustive combinatorial search as an MCP server. Given a discrete search space, Brute Genius enumerates the full Cartesian product, shards it across a fleet of accelerators, scores every combination against a named objective, and returns a ranked list. It does not sample or prune; it tries everything.
++Exhaustive combinatorial search as an MCP server. Given a discrete search space, Brute Genius enumerates the full Cartesian product, shards it, scores every combination against a named objective, and returns a ranked list. It does not sample or prune; it tries everything.
+ 
+-**Warning: this plugin spends real money fast.** Always call `brute_genius_plan` first and respect the cost ceiling it returns. `brute_genius_kill` is the emergency stop.
++**Current build, stated plainly:** shards are evaluated *sequentially, in-process, on the host* (in a worker thread so `status` and `kill` stay responsive). Nodes are provisioned and billed through a `GPUProvider` seam, but they do not execute the work yet: remote execution is on the [Roadmap](#roadmap). The only provider wired into the server is `MockProvider`, whose money is simulated, so nothing is spent today. `RunPodProvider` exists but cannot run launches yet (`run_command` and `charge` are not implemented).
++
++Always call `brute_genius_plan` first and respect the cost ceiling it returns. `brute_genius_kill` is the emergency stop.
+ 
+ ## Connect to Claude Desktop
+ 
+@@ -26,7 +28,7 @@
+ }
+ ```
+ 
+-3. Restart Claude Desktop. The tools `brute_genius_plan`, `brute_genius_launch`, `brute_genius_status`, `brute_genius_results`, `brute_genius_kill`, and `xpu_probe` will appear, along with the resources and prompts.
++3. Restart Claude Desktop. The tools and resources below will appear, along with the prompts.
+ 
+ For other clients (Cursor, Copilot, etc.) point the MCP host at the same `python /absolute/path/to/server.py` stdio command. For remote/HTTP use:
+ 
+@@ -34,6 +36,21 @@
+ mcp.run(transport="http", host="0.0.0.0", port=8000)
+ ```
+ 
++## Tools and resources
++
++| Name | Kind | What it does |
++| --- | --- | --- |
++| `brute_genius_plan` | tool | Counts the space, estimates cost, stores the ceiling. Executes nothing. |
++| `brute_genius_launch` | tool | Re-checks the ceiling and balance, provisions nodes, charges the estimate, scores shards sequentially on the host. |
++| `brute_genius_status` | tool | Live state, shards done, combinations evaluated, best-so-far. |
++| `brute_genius_results` | tool | Top-k combinations, best first (partial while a run is live). |
++| `brute_genius_kill` | tool | Stops every node for a plan and aborts scoring. |
++| `xpu_probe` | tool | Reports detected accelerators, provider rates and balance. |
++| `brutegenius://plans` | resource | All plans and their states. |
++| `brutegenius://plans/{plan_id}/combinations` | resource | First 1 000 combinations of a plan. |
++| `brutegenius://hardware` | resource | Accelerators visible to this process. |
++| `brutegenius://pricing` | resource | Rates per chip and the account balance, read through the provider's async `get_balance()`. |
++
+ ## Quick test
+ 
+ ```bash
+@@ -43,7 +60,38 @@
+ 
+ ## Safety guarantees
+ 
+-- `plan()` refuses any estimate above `max_cost_usd`
+-- Hard caps: 64 nodes, 10⁹ combinations
+-- Objectives are registry-only; caller code is never executed
+-- `kill()` always stops every node associated with a plan_id
++Each of these is covered by a test in `test_server.py`.
++
++- `plan()` refuses any estimate above `max_cost_usd` and stores that ceiling in the plan.
++- `launch()` recomputes the cost after any `chip`/`nodes` override and refuses anything above the plan's ceiling, before any node is created. A refused override leaves the plan unchanged.
++- `launch()` refuses when the estimate exceeds the provider balance, and otherwise **charges the estimate against the balance before scoring** (`provider.charge`; insufficient funds raise). There is no refund on early `kill` yet (Roadmap).
++- If provisioning fails partway, or scoring raises, `launch()` stops every node it created. A provisioning failure leaves the plan `planned` and relaunchable with clean counters; a scoring failure marks it `failed`.
++- A `killed` or `failed` plan cannot be relaunched; create a new plan. A `done` plan cannot be launched again.
++- `kill()` is reachable while scoring runs, stops every node associated with the plan_id, and reports the results of all shards that finished. A shard interrupted mid-way is discarded, not partially kept.
++- Hard caps: 64 nodes, 10⁹ combinations, at least one axis in the space.
++- Objectives are registry-only; caller code is never executed.
++
++## Roadmap
++
++**Near-term (this pass)**
++
++- [x] Index-based sharding: each shard decodes only its own indices (A1)
++- [x] Cost ceiling re-enforced at launch (A2)
++- [x] Ledger-backed balance with `charge()` (A3)
++- [x] Coherent relaunch semantics: refuse killed/failed/done; reset a rolled-back `planned` plan (A4)
++- [x] Incremental results so status/results/kill see live partials (A5)
++- [x] Provisioning rollback (A6)
++
++**Next**
++
++- [ ] **C1. True parallelism.** Dispatch shards concurrently with `asyncio.gather` over `xpu.batch_score` running in `run_in_executor`, or move scoring into worker processes. Add a `concurrency` parameter (default 1, capped at `MAX_NODES`).
++- [ ] **C2. Vectorized objectives.** Provide a torch-backed variant of `sphere`/`rastrigin`/`rosenbrock` that batches a shard into a tensor and returns scores; keep the pure-Python path as the fallback and as the reference for tests. `device` then actually influences execution.
++- [ ] **C3. Remote execution.** Implement `RunPodProvider.run_command` via SSH/paramiko, or bake a scoring entrypoint image; add `GPUProvider.run_shard(...)` so shards ship to nodes instead of being scored locally.
++
++**Later**
++
++- [ ] Plan TTL / eviction for `_plans` (bounded LRU, e.g. 256 entries, 24 h TTL).
++- [ ] Refund the unused estimate on early kill (needs a per-second billing surface).
++- [ ] Resume-from-checkpoint per shard using the index-based decoder (persist `k_last` per shard); this would also keep the partial work of a shard that is killed mid-way.
++- [ ] Structured `_log` JSON lines with `plan_id`, `shard_idx`, `event`.
++- [ ] Optional webhook / `ctx.set_status` for plan lifecycle events.
+diff -ruN -x __pycache__ orig/enumerator.py brute-genius/enumerator.py
+--- orig/enumerator.py	2026-11-01 22:12:46.472415668 +0000
++++ brute-genius/enumerator.py	2026-11-01 22:13:55.951587226 +0000
+@@ -1,11 +1,16 @@
+ """Lazy Cartesian enumeration with independent, resumable sharding.
+ 
+ The engine never holds the full combination list in memory. It streams.
++
++Every combination has a global index in ``range(count(space))``. ``combo_at``
++decodes an index straight into a combination (mixed radix, last axis varies
++fastest, i.e. the same order as ``itertools.product``), so a shard jumps
++directly to its own indices instead of re-walking the whole product.
++
+ Hard limit: MAX_COMBINATIONS = 10**9.
+ """
+ from __future__ import annotations
+ 
+-from itertools import product
+ from typing import Any, Iterator
+ 
+ MAX_COMBINATIONS = 10**9
+@@ -23,35 +28,58 @@
+             return 0
+         total *= len(values)
+         if total > MAX_COMBINATIONS:
+-            # Early exit once we know we have already exceeded the hard cap.
++            # Intentional: return the over-cap value (not the exact product) as
++            # soon as we know it is over the cap, so callers can format the
++            # "exceeds hard limit" error without us multiplying forever.
+             return total
+     return total
+ 
+ 
+-def cartesian(space: dict[str, list]) -> Iterator[dict[str, Any]]:
+-    """Lazily yield every combination as a dict. Never materialises the set."""
+-    if not space:
+-        yield {}
+-        return
++def combo_at(space: dict[str, list], index: int) -> dict[str, Any]:
++    """Decode global ``index`` into its combination (mixed-radix, O(#axes)).
++
++    Raises IndexError if ``index`` is outside ``range(count(space))``.
++    """
++    if index < 0:
++        raise IndexError(f"index {index} is negative")
+     axes = list(space.keys())
+-    for combo in product(*(space[a] for a in axes)):
+-        yield dict(zip(axes, combo))
++    combo: dict[str, Any] = {}
++    for axis in reversed(axes):
++        values = space[axis]
++        if not values:
++            raise IndexError(f"axis '{axis}' is empty; space has no combinations")
++        index, pos = divmod(index, len(values))
++        combo[axis] = values[pos]
++    if index:  # digits left over -> index >= count(space)
++        raise IndexError("index is outside the search space")
++    return {a: combo[a] for a in axes}
++
++
++def cartesian(space: dict[str, list]) -> Iterator[dict[str, Any]]:
++    """Lazily yield every combination as a dict. Never materialises the set.
++
++    Decodes via ``combo_at`` so there is exactly one decoding path.
++    """
++    for k in range(count(space)):
++        yield combo_at(space, k)
+ 
+ 
+ def shard(space: dict[str, list], n_shards: int) -> list[Iterator[dict[str, Any]]]:
+-    """Split the space by modular index so each shard is independent and resumable.
++    """Split the space by modular global index; each shard does only its own work.
+ 
+-    Shard i yields combinations whose global index satisfies index % n_shards == i.
+-    This makes shards independent: a node can be restarted from the beginning of
+-    its shard without coordinating with other nodes.
++    Shard ``i`` yields the combinations whose global index ``k`` satisfies
++    ``k % n_shards == i`` and decodes each one directly with ``combo_at``. It
++    does not scan the other shards' combinations, so total work across all
++    shards is ``count(space)``, not ``n_shards * count(space)``. Shards are
++    independent: a node can restart its shard without coordinating with others.
+     """
+     if n_shards < 1:
+         raise ValueError("n_shards must be >= 1")
++    total = count(space)
+ 
+     def _shard_iter(idx: int) -> Iterator[dict[str, Any]]:
+-        for i, combo in enumerate(cartesian(space)):
+-            if i % n_shards == idx:
+-                yield combo
++        for k in range(idx, total, n_shards):
++            yield combo_at(space, k)
+ 
+     return [_shard_iter(i) for i in range(n_shards)]
+ 
+diff -ruN -x __pycache__ orig/mock_provider.py brute-genius/mock_provider.py
+--- orig/mock_provider.py	2026-11-01 22:12:46.473231022 +0000
++++ brute-genius/mock_provider.py	2026-11-01 22:14:08.084052762 +0000
+@@ -61,6 +61,16 @@
+     async def get_balance(self) -> float:
+         return self.balance
+ 
++    async def charge(self, amount_usd: float) -> float:
++        if amount_usd < 0:
++            raise ValueError("amount_usd must be >= 0")
++        if amount_usd > self.balance:
++            raise RuntimeError(
++                f"Insufficient balance: need ${amount_usd:.4f}, have ${self.balance:.4f}"
++            )
++        self.balance -= amount_usd
++        return self.balance
++
+     async def get_payment_link(self, amount: int) -> str:
+         return f"https://pay.example.com/topup?amount={amount}"
+ 
+diff -ruN -x __pycache__ orig/provider.py brute-genius/provider.py
+--- orig/provider.py	2026-11-01 22:12:46.473359189 +0000
++++ brute-genius/provider.py	2026-11-01 22:14:08.083854914 +0000
+@@ -42,6 +42,16 @@
+         ...
+ 
+     @abstractmethod
++    async def charge(self, amount_usd: float) -> float:
++        """Deduct ``amount_usd`` from the balance and return the new balance.
++
++        Must raise (never silently succeed) if the amount cannot be charged:
++        RuntimeError for insufficient funds, NotImplementedError if the backend
++        has no way to bill from here.
++        """
++        ...
++
++    @abstractmethod
+     async def get_payment_link(self, amount: int) -> str:
+         """Return a URL the user can open to top up `amount` USD."""
+         ...
+diff -ruN -x __pycache__ orig/runpod_provider.py brute-genius/runpod_provider.py
+--- orig/runpod_provider.py	2026-11-01 22:12:46.474101611 +0000
++++ brute-genius/runpod_provider.py	2026-11-01 22:14:08.084220991 +0000
+@@ -10,8 +10,13 @@
+     set it as the pod entrypoint, or wire SSH/paramiko yourself.
+   - get_balance uses runpod.get_user(); if your SDK version differs, fall back
+     to the REST billing endpoint.
+-  - Cost ceilings in brute_genius_plan still gate create_instance — always
+-    call plan() first.
++  - charge is intentionally not implemented: RunPod bills per pod-second on the
++    account and exposes no "deduct this amount" call. brute_genius_launch
++    charges before scoring, so launching on this provider currently fails
++    *after* provisioning and rolls the pods back (stop_pod). This provider is
++    not wired into server.py; see the README Roadmap.
++  - Cost ceilings are enforced by brute_genius_plan and re-enforced (after any
++    chip/nodes override) by brute_genius_launch before any pod is created.
+ """
+ from __future__ import annotations
+ 
+@@ -128,6 +133,14 @@
+                 ) from exc
+         return float(info.get("balance", 0.0) if isinstance(info, dict) else 0.0)
+ 
++    async def charge(self, amount_usd: float) -> float:
++        # Do not pretend: RunPod has no per-amount charge API.
++        raise NotImplementedError(
++            "RunPodProvider cannot deduct a fixed amount: RunPod bills per pod-second "
++            "on the account. Implement charge() against a billing surface you control "
++            "before using this provider with brute_genius_launch."
++        )
++
+     async def get_payment_link(self, amount: int) -> str:
+         # RunPod has no per-amount payment-link API.
+         return "https://www.runpod.io/console/user/billing"
+diff -ruN -x __pycache__ orig/server.py brute-genius/server.py
+--- orig/server.py	2026-11-01 22:12:46.474231599 +0000
++++ brute-genius/server.py	2026-11-01 22:15:08.600266661 +0000
+@@ -1,18 +1,28 @@
+ """Brute Genius MCP Server.
+ 
+-Exhaustive combinatorial search on a fleet of accelerators.
+-One mode only: try every combination known to man.
+-
+-Safety rules (enforced):
+-  - plan() refuses if estimated cost > max_cost_usd
+-  - launch() re-checks balance before dispatching
+-  - kill() always available and stops every node for a plan
++Exhaustive combinatorial search over a discrete space. The space is sharded and
++the shards are scored one after another, in-process, on the host (in a worker
++thread so the server stays responsive to status/kill). Fleet nodes are
++provisioned and billed through a GPUProvider seam, but remote execution is not
++implemented yet; see the README Roadmap.
++
++Safety rules (each covered by a test in test_server.py):
++  - plan() refuses if estimated cost > max_cost_usd, and stores that ceiling
++  - launch() recomputes the cost after any chip/nodes override and refuses if it
++    exceeds the plan's ceiling, before any node is created
++  - launch() refuses if the estimate exceeds the provider balance, then charges
++    the estimate up front (provider.charge) before scoring. Insufficient funds
++    raise. There is no refund on early kill yet
++  - a launch that fails while provisioning or scoring stops every node it created
++  - a killed or failed plan cannot be relaunched; create a new plan
++  - kill() is reachable while scoring runs and stops every node for a plan
+   - Hard caps: MAX_NODES = 64, MAX_COMBINATIONS = 10**9
+   - Objective functions are looked up by name from a registry only
+   - Never write to stdout in stdio mode; use ctx logging / stderr
+ """
+ from __future__ import annotations
+ 
++import asyncio
+ import sys
+ import time
+ import uuid
+@@ -37,8 +47,9 @@
+     "brute-genius",
+     instructions=(
+         "Brute Genius performs exhaustive Cartesian search over a discrete "
+-        "space on a fleet of accelerators. Always call brute_genius_plan "
+-        "first and respect the cost ceiling. Never launch without a plan_id."
++        "space. Shards are currently scored sequentially on the host. Always "
++        "call brute_genius_plan first and respect the cost ceiling. Never "
++        "launch without a plan_id."
+     ),
+ )
+ 
+@@ -53,6 +64,24 @@
+     print(msg, file=sys.stderr, flush=True)
+ 
+ 
++def _estimate(total: int, nodes: int, chip: str) -> tuple[float, float]:
++    """Return (estimated minutes, estimated USD) for a run. One formula, used by
++    both plan() and launch() so an override can never dodge the ceiling."""
++    rate = provider.hourly_rate(chip)
++    est_minutes = max(total / (nodes * COMBOS_PER_NODE_PER_MINUTE), 0.01)
++    est_cost = est_minutes / 60.0 * rate * nodes
++    return est_minutes, est_cost
++
++
++async def _stop_nodes(names: list[str]) -> None:
++    """Best-effort stop of every named node; failures are logged, not hidden."""
++    for name in names:
++        try:
++            await provider.stop_instance(name)
++        except Exception as exc:
++            _log(f"failed to stop node {name}: {exc!r}")
++
++
+ # ─── TOOLS ─────────────────────────────────────────────────────────────────
+ 
+ @mcp.tool()
+@@ -75,6 +104,9 @@
+         chip: Accelerator type (h100, a100, l40s, cpu).
+         nodes: Number of nodes to shard across (1–64).
+     """
++    if not space:
++        raise ValueError("Search space must contain at least one axis")
++
+     # Validate objective name early (raises KeyError if unknown)
+     objectives.get(objective)
+ 
+@@ -92,11 +124,9 @@
+         raise ValueError(f"nodes={nodes} exceeds MAX_NODES={MAX_NODES}")
+ 
+     chip = chip.lower()
+-    rate = provider.hourly_rate(chip)
+-    # Wall-clock estimate in minutes, then convert to cost
+-    est_minutes = max(total / (nodes * COMBOS_PER_NODE_PER_MINUTE), 0.01)
+-    est_hours = est_minutes / 60.0
+-    est_cost = est_hours * rate * nodes
++    if chip not in provider.RATES:
++        raise ValueError(f"Unknown chip '{chip}'. Known: {sorted(provider.RATES)}")
++    est_minutes, est_cost = _estimate(total, nodes, chip)
+ 
+     if est_cost > max_cost_usd:
+         raise ValueError(
+@@ -113,6 +143,7 @@
+         "chip": chip,
+         "nodes": nodes,
+         "total": total,
++        "max_cost_usd": max_cost_usd,
+         "est_cost_usd": round(est_cost, 6),
+         "est_minutes": round(est_minutes, 4),
+         "state": "planned",
+@@ -121,6 +152,7 @@
+         "created_at": time.time(),
+         "started_at": None,
+         "finished_at": None,
++        "killed_at": None,
+         "combinations_evaluated": 0,
+         "best_so_far": None,
+         "device_used": None,
+@@ -147,8 +179,13 @@
+ ) -> dict[str, Any]:
+     """Shard the enumerated space and score every combination.
+ 
+-    Re-checks balance and cost ceiling before any work is dispatched.
+-    Streams progress via ctx.report_progress and logs via ctx.info.
++    Before any node is created this recomputes the cost for the final chip and
++    node count (refusing anything above the plan's ceiling) and checks it
++    against the provider balance. After provisioning it charges the estimate up
++    front; there is no refund if the run is killed early. Shards are then
++    scored one after another on the host (in a worker thread, so status and
++    kill stay responsive). A launch that fails stops every node it created.
++    Only a "planned" plan can be launched.
+ 
+     Args:
+         plan_id: Identifier returned by brute_genius_plan.
+@@ -158,116 +195,164 @@
+     plan = _plans.get(plan_id)
+     if plan is None:
+         raise ValueError(f"Unknown plan_id '{plan_id}'")
+-    if plan["state"] not in ("planned", "killed"):
++    if plan["state"] == "killed":
++        raise ValueError(f"Plan '{plan_id}' was killed; create a new plan")
++    if plan["state"] != "planned":
+         raise ValueError(
+             f"Plan '{plan_id}' is in state '{plan['state']}' and cannot be launched"
+         )
+ 
+-    # Allow late overrides
+-    if chip is not None:
+-        plan["chip"] = chip.lower()
+-    if nodes is not None:
+-        if nodes < 1 or nodes > MAX_NODES:
+-            raise ValueError(f"nodes must be 1–{MAX_NODES}")
+-        plan["nodes"] = nodes
+-
+-    await ctx.info(
+-        f"Launching plan {plan_id}: {plan['total']:,} combinations on "
+-        f"{plan['nodes']}×{plan['chip']} (est. ${plan['est_cost_usd']:.4f})"
+-    )
++    # Resolve overrides locally. Nothing is written to the plan until every
++    # check below has passed, so a refused launch leaves the plan untouched.
++    new_chip = chip.lower() if chip is not None else plan["chip"]
++    new_nodes = nodes if nodes is not None else plan["nodes"]
++    if new_chip not in provider.RATES:
++        raise ValueError(f"Unknown chip '{new_chip}'. Known: {sorted(provider.RATES)}")
++    if new_nodes < 1 or new_nodes > MAX_NODES:
++        raise ValueError(f"nodes must be 1–{MAX_NODES}")
++
++    # Safety: recompute cost for the final configuration and enforce the ceiling.
++    est_minutes, est_cost = _estimate(plan["total"], new_nodes, new_chip)
++    if est_cost > plan["max_cost_usd"]:
++        raise ValueError(
++            f"Override would cost ${est_cost:.4f}, exceeds ceiling "
++            f"${plan['max_cost_usd']:.2f}"
++        )
++    est_cost = round(est_cost, 6)
+ 
+-    # Safety: re-check balance
++    # Safety: check balance (the ledger is charged after provisioning, below).
+     balance = await provider.get_balance()
+     if balance <= 0:
+         raise RuntimeError(
+             "Account balance is $0. Top up before launching. "
+             "Use the provider payment link."
+         )
+-    if plan["est_cost_usd"] > balance:
++    if est_cost > balance:
+         raise RuntimeError(
+-            f"Estimated cost ${plan['est_cost_usd']:.4f} exceeds "
+-            f"current balance ${balance:.2f}"
++            f"Estimated cost ${est_cost:.4f} exceeds current balance ${balance:.2f}"
+         )
+ 
+-    # Provision simulated nodes
+-    node_names: list[str] = []
+-    for i in range(plan["nodes"]):
+-        name = f"{plan_id[:8]}-node-{i}"
+-        await provider.create_instance(name, plan["chip"])
+-        node_names.append(name)
+-        plan["shards"].append(
+-            {"node": name, "index": i, "status": "running", "scored": 0}
++    # Another launch/kill may have run during the awaits above.
++    if plan["state"] != "planned":
++        raise ValueError(
++            f"Plan '{plan_id}' is in state '{plan['state']}' and cannot be launched"
+         )
+ 
++    plan.update(
++        chip=new_chip,
++        nodes=new_nodes,
++        est_cost_usd=est_cost,
++        est_minutes=round(est_minutes, 4),
++        state="provisioning",  # blocks a concurrent second launch of this plan
++        shards=[],
++        results=[],
++        combinations_evaluated=0,
++        best_so_far=None,
++        started_at=None,
++        finished_at=None,
++        killed_at=None,
++    )
++
++    await ctx.info(
++        f"Launching plan {plan_id}: {plan['total']:,} combinations on "
++        f"{plan['nodes']}×{plan['chip']} (est. ${plan['est_cost_usd']:.4f})"
++    )
++
++    # Provision, then charge. Any failure (or cancellation) stops every node
++    # created so far and leaves the plan launchable again.
++    node_names: list[str] = []
++    try:
++        for i in range(plan["nodes"]):
++            name = f"{plan_id[:8]}-node-{i}"
++            await provider.create_instance(name, plan["chip"])
++            node_names.append(name)
++            plan["shards"].append(
++                {"node": name, "index": i, "status": "running", "scored": 0}
++            )
++        if plan["state"] != "provisioning":  # brute_genius_kill landed meanwhile
++            raise RuntimeError(f"Plan '{plan_id}' was killed during provisioning")
++        remaining = await provider.charge(plan["est_cost_usd"])
++    except BaseException as exc:
++        _log(f"launch {plan_id} failed while provisioning: {exc!r}; stopping nodes")
++        await _stop_nodes(node_names)
++        plan["shards"] = []
++        if plan["state"] != "killed":
++            plan["state"] = "planned"
++        raise
++    await ctx.info(
++        f"Charged ${plan['est_cost_usd']:.4f}; balance now ${remaining:.2f}"
++    )
++
+     plan["state"] = "running"
+     plan["started_at"] = time.time()
+-    plan["results"] = []
+-    plan["combinations_evaluated"] = 0
+-    plan["best_so_far"] = None
+ 
+     fn = objectives.get(plan["objective"])
+-    device = xpu.pick_device(preferred=plan["chip"] if plan["chip"] != "cpu" else "cpu")
++    device = xpu.pick_device(preferred=xpu.CHIP_DEVICE_HINTS.get(plan["chip"], "cpu"))
+     plan["device_used"] = device
+     await ctx.info(f"Scoring device for this run: {device}")
+ 
+     shards = enumerator.shard(plan["space"], plan["nodes"])
+-    all_scored: list[tuple[dict[str, Any], float]] = []
+-
+-    for i, shard_iter in enumerate(shards):
+-        if plan["state"] == "killed":
+-            await ctx.info(f"Plan {plan_id} killed before shard {i + 1}")
+-            break
+ 
+-        await ctx.report_progress(
+-            progress=i,
+-            total=plan["nodes"],
+-            message=f"Dispatching shard {i + 1}/{plan['nodes']}",
+-        )
+-        await ctx.info(f"Shard {i} → node {node_names[i]} on {device}")
+-
+-        try:
+-            scored = xpu.batch_score(shard_iter, fn, device, plan=plan)
+-        except RuntimeError:
+-            await ctx.info(
+-                f"Plan {plan_id} killed mid-shard {i + 1}; "
+-                f"keeping {len(all_scored)} partial results"
++    try:
++        for i, shard_iter in enumerate(shards):
++            if plan["state"] == "killed":
++                await ctx.info(f"Plan {plan_id} killed before shard {i + 1}")
++                break
++
++            await ctx.report_progress(
++                progress=i,
++                total=plan["nodes"],
++                message=f"Dispatching shard {i + 1}/{plan['nodes']}",
+             )
+-            plan["shards"][i]["status"] = "stopped"
+-            break
+-
+-        all_scored.extend(scored)
+-
+-        plan["shards"][i]["status"] = "done"
+-        plan["shards"][i]["scored"] = len(scored)
+-        plan["combinations_evaluated"] = len(all_scored)
+-
+-        # Keep a running best
+-        if scored:
+-            local_best = max(scored, key=lambda x: x[1])
+-            if plan["best_so_far"] is None or local_best[1] > plan["best_so_far"]["score"]:
+-                plan["best_so_far"] = {"combo": local_best[0], "score": local_best[1]}
+-
+-        await ctx.report_progress(
+-            progress=i + 1,
+-            total=plan["nodes"],
+-            message=f"Shard {i + 1}/{plan['nodes']} complete ({len(scored)} scored)",
+-        )
++            await ctx.info(f"Shard {i} → node {node_names[i]} on {device}")
+ 
+-    # Final ranking
+-    all_scored.sort(key=lambda x: x[1], reverse=True)
+-    plan["results"] = all_scored
+-    plan["combinations_evaluated"] = len(all_scored)
++            try:
++                # Worker thread: the event loop stays free to serve status/kill.
++                scored = await asyncio.to_thread(
++                    xpu.batch_score, shard_iter, fn, device, plan=plan
++                )
++            except RuntimeError:
++                if plan["state"] != "killed":
++                    raise  # a real scoring error, not the kill signal
++                await ctx.info(
++                    f"Plan {plan_id} killed mid-shard {i + 1}; "
++                    f"keeping {plan['combinations_evaluated']} partial results"
++                )
++                plan["shards"][i]["status"] = "stopped"
++                break
++
++            # Publish this shard's results immediately so status/results/kill
++            # see live partials. Keep the list sorted best-first at all times.
++            plan["results"].extend(scored)
++            plan["results"].sort(key=lambda x: x[1], reverse=True)
++            plan["shards"][i]["status"] = "done"
++            plan["shards"][i]["scored"] = len(scored)
++            plan["combinations_evaluated"] += len(scored)
++            if scored:
++                local_best = max(scored, key=lambda x: x[1])
++                best = plan["best_so_far"]
++                if best is None or local_best[1] > best["score"]:
++                    plan["best_so_far"] = {"combo": local_best[0], "score": local_best[1]}
++
++            await ctx.report_progress(
++                progress=i + 1,
++                total=plan["nodes"],
++                message=f"Shard {i + 1}/{plan['nodes']} complete ({len(scored)} scored)",
++            )
++    except BaseException as exc:
++        _log(f"launch {plan_id} failed while scoring: {exc!r}; stopping nodes")
++        if plan["state"] != "killed":
++            plan["state"] = "failed"
++        plan["finished_at"] = time.time()
++        await _stop_nodes(node_names)
++        raise
+ 
+     if plan["state"] != "killed":
+         plan["state"] = "done"
+     plan["finished_at"] = time.time()
+ 
+-    # Stop billing on the simulated nodes
+-    for name in node_names:
+-        try:
+-            await provider.stop_instance(name)
+-        except Exception:
+-            pass
++    # Stop billing on the nodes
++    await _stop_nodes(node_names)
+ 
+     await ctx.info(
+         f"Plan {plan_id} finished with state={plan['state']}. "
+@@ -279,6 +364,10 @@
+         "state": plan["state"],
+         "combinations_evaluated": plan["combinations_evaluated"],
+         "device": device,
++        "chip": plan["chip"],
++        "nodes": plan["nodes"],
++        "estimated_cost_usd": plan["est_cost_usd"],
++        "balance_usd": remaining,
+         "best_so_far": plan["best_so_far"],
+     }
+ 
+@@ -327,8 +416,9 @@
+ async def brute_genius_kill(plan_id: str) -> dict[str, Any]:
+     """Stop every node and shard belonging to a plan. Ends billing.
+ 
+-    Partial results already scored are preserved. Always available even
+-    if the calling agent goes silent.
++    Results from shards that already finished are preserved (a shard that is
++    interrupted mid-way is discarded). Already-charged cost is not refunded.
++    Reachable while scoring runs, because scoring happens off the event loop.
+     """
+     plan = _plans.get(plan_id)
+     if plan is None:
+@@ -348,8 +438,8 @@
+                 await provider.stop_instance(name)
+                 shard_meta["status"] = "stopped"
+                 stopped += 1
+-            except Exception:
+-                pass
++            except Exception as exc:
++                _log(f"kill {plan_id}: failed to stop node {name}: {exc!r}")
+ 
+     return {
+         "plan_id": plan_id,
+@@ -363,7 +453,7 @@
+ 
+ @mcp.tool()
+ async def xpu_probe(chip: str = "h100") -> dict[str, Any]:
+-    """Detect and report available accelerators on the current machine/fleet.
++    """Detect and report accelerators on the machine running this server.
+ 
+     Args:
+         chip: Preferred chip name (informational; detection is exhaustive).
+@@ -429,11 +519,11 @@
+ 
+ 
+ @mcp.resource("brutegenius://pricing")
+-def pricing() -> dict[str, Any]:
+-    """Current burn rate per chip type (USD per hour)."""
++async def pricing() -> dict[str, Any]:
++    """Current burn rate per chip type (USD per hour) and account balance."""
+     return {
+         "rates_usd_per_hour": dict(provider.RATES),
+-        "balance_usd": provider.balance,  # sync read is fine for mock
++        "balance_usd": await provider.get_balance(),
+         "currency": "USD",
+     }
+ 
+diff -ruN -x __pycache__ orig/test_server.py brute-genius/test_server.py
+--- orig/test_server.py	2026-11-01 22:12:46.474448368 +0000
++++ brute-genius/test_server.py	2026-11-01 22:13:43.714345735 +0000
+@@ -6,10 +6,18 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import itertools
++import json
++import time
+ 
+ import pytest
+ from fastmcp import Client
+ 
++import enumerator
++import xpu as xpu_mod
++from mock_provider import MockProvider
++from runpod_provider import RunPodProvider
++
+ # Import the live server instance
+ from server import mcp, _plans, provider
+ 
+@@ -76,9 +84,7 @@
+                     "max_cost_usd": 1e9,
+                 },
+             )
+-        assert "exceeds hard limit" in str(exc_info.value).lower() or "10" in str(
+-            exc_info.value
+-        )
++        assert "exceeds hard limit" in str(exc_info.value).lower()
+ 
+ 
+ @pytest.mark.asyncio
+@@ -344,3 +350,370 @@
+             "brute_genius_results", {"plan_id": pid, "top_k": 5}
+         )
+         assert isinstance(res.data, list)
++
++
++# ═══════════════════════════════════════════════════════════════════════════
++# Hardening pass (A1–A6, B5, E)
++# ═══════════════════════════════════════════════════════════════════════════
++
++async def _plan(c, space=SPACE_3X3X3, objective="sphere", max_cost=10.0, **kw):
++    r = await c.call_tool(
++        "brute_genius_plan",
++        {"space": space, "objective": objective, "max_cost_usd": max_cost, **kw},
++    )
++    return r.data["plan_id"]
++
++
++def _spent(start: float = 25.0) -> float:
++    """Dollars deducted from the mock ledger. (pytest.approx's default tolerance
++    on a $25 balance is larger than a typical charge here, so compare exactly.)"""
++    return start - provider.balance
++
++
++async def _wait_for(pred, timeout=5.0):
++    deadline = time.monotonic() + timeout
++    while not pred():
++        if time.monotonic() > deadline:
++            raise AssertionError("timed out waiting for condition")
++        await asyncio.sleep(0.005)
++
++
++# ─── A1: index-based sharding ──────────────────────────────────────────────
++
++def test_combo_at_matches_product_order():
++    space = {"a": [1, 2, 3], "b": ["x", "y"], "c": [0, 1, 2, 3]}  # 24
++    expected = [dict(zip(space, t)) for t in itertools.product(*space.values())]
++    assert [enumerator.combo_at(space, k) for k in range(24)] == expected
++    with pytest.raises(IndexError):
++        enumerator.combo_at(space, 24)
++    with pytest.raises(IndexError):
++        enumerator.combo_at(space, -1)
++
++
++def test_shards_partition_the_space():
++    space = {"a": list(range(3)), "b": list(range(4)), "c": list(range(5))}  # 60
++    seen = [tuple(c.values()) for s in enumerator.shard(space, 7) for c in s]
++    assert len(seen) == 60
++    assert set(seen) == set(itertools.product(*space.values()))
++
++
++def test_shard_total_work_is_linear(monkeypatch):
++    space = {"x": list(range(10)), "y": list(range(10)), "z": list(range(10))}
++    calls = {"n": 0}
++    real = enumerator.combo_at
++
++    def counting(sp, index):
++        calls["n"] += 1
++        return real(sp, index)
++
++    monkeypatch.setattr(enumerator, "combo_at", counting)
++    per_shard = [sum(1 for _ in s) for s in enumerator.shard(space, 4)]
++    assert per_shard == [250, 250, 250, 250]
++    assert calls["n"] == 1000  # total, not 4 x total
++
++
++# ─── A2: cost recomputed at launch ─────────────────────────────────────────
++
++@pytest.mark.asyncio
++async def test_launch_override_recomputes_cost():
++    async with Client(mcp) as c:
++        # 1 x h100 ~ $1.4e-5, under the 2e-5 ceiling; 64 nodes ~ $9e-4, over it.
++        pid = await _plan(c, max_cost=2e-5, nodes=1)
++        with pytest.raises(Exception) as exc_info:
++            await c.call_tool("brute_genius_launch", {"plan_id": pid, "nodes": 64})
++        assert "ceiling" in str(exc_info.value).lower()
++        assert provider._nodes == {}
++        assert _plans[pid]["state"] == "planned"
++        assert _plans[pid]["nodes"] == 1  # rejected override left no trace
++
++
++@pytest.mark.asyncio
++async def test_launch_override_within_ceiling_updates_cost():
++    async with Client(mcp) as c:
++        pid = await _plan(c, max_cost=1.0, nodes=1)
++        r = await c.call_tool("brute_genius_launch", {"plan_id": pid, "nodes": 2})
++        expected = round(0.01 / 60.0 * 0.084 * 2, 6)
++        assert r.data["estimated_cost_usd"] == pytest.approx(expected)
++        st = await c.call_tool("brute_genius_status", {"plan_id": pid})
++        assert st.data["estimated_cost_usd"] == pytest.approx(expected)
++        assert st.data["shards_total"] == 2
++
++
++@pytest.mark.asyncio
++async def test_unknown_chip_rejected_at_plan_and_launch():
++    async with Client(mcp) as c:
++        with pytest.raises(Exception):
++            await _plan(c, chip="quantum9000")
++        pid = await _plan(c)
++        with pytest.raises(Exception):
++            await c.call_tool(
++                "brute_genius_launch", {"plan_id": pid, "chip": "quantum9000"}
++            )
++        assert provider._nodes == {}
++
++
++# ─── A3: balance is a real ledger ──────────────────────────────────────────
++
++@pytest.mark.asyncio
++async def test_launch_refuses_when_balance_too_low():
++    big = {"x": list(range(1000)), "y": list(range(1000))}  # 1e6 combos ~ $0.014
++    async with Client(mcp) as c:
++        pid = await _plan(c, space=big, max_cost=10.0)
++        provider.balance = 0.005
++        with pytest.raises(Exception) as exc_info:
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert "balance" in str(exc_info.value).lower()
++        assert _plans[pid]["state"] == "planned"
++        assert provider._nodes == {}
++        assert provider.balance == 0.005
++
++
++@pytest.mark.asyncio
++async def test_launch_charges_balance():
++    async with Client(mcp) as c:
++        pid = await _plan(c)
++        cost = _plans[pid]["est_cost_usd"]
++        assert cost > 0
++        await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert _spent() > 0
++        assert abs(_spent() - cost) < 1e-9
++
++
++@pytest.mark.asyncio
++async def test_mock_charge_rejects_overdraft():
++    p = MockProvider(balance=1.0)
++    assert await p.charge(0.25) == pytest.approx(0.75)
++    with pytest.raises(RuntimeError):
++        await p.charge(5.0)
++    assert p.balance == pytest.approx(0.75)
++
++
++@pytest.mark.asyncio
++async def test_runpod_charge_is_not_silent():
++    rp = object.__new__(RunPodProvider)  # skip __init__: no SDK / API key here
++    with pytest.raises(NotImplementedError):
++        await rp.charge(1.0)
++
++
++# ─── A4: relaunch is refused ───────────────────────────────────────────────
++
++@pytest.mark.asyncio
++async def test_relaunch_done_plan_rejected():
++    async with Client(mcp) as c:
++        pid = await _plan(c, nodes=3)
++        await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        with pytest.raises(Exception) as exc_info:
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert "cannot be launched" in str(exc_info.value).lower()
++        st = await c.call_tool("brute_genius_status", {"plan_id": pid})
++        assert st.data["shards_done"] == st.data["shards_total"] == 3
++
++
++@pytest.mark.asyncio
++async def test_relaunch_killed_plan_rejected():
++    async with Client(mcp) as c:
++        pid = await _plan(c, nodes=2)
++        await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        await c.call_tool("brute_genius_kill", {"plan_id": pid})
++        balance = provider.balance
++        with pytest.raises(Exception) as exc_info:
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert "create a new plan" in str(exc_info.value).lower()
++        assert provider.balance == balance  # no second charge
++
++
++# ─── A5: live partials + kill is reachable mid-run ─────────────────────────
++
++@pytest.mark.asyncio
++async def test_kill_tool_reports_partial_results(monkeypatch):
++    def slow_batch_score(shard, fn, device, batch_size=64, plan=None):
++        results, batch = [], []
++
++        def _check():
++            if plan is not None and plan.get("state") == "killed":
++                raise RuntimeError("Plan killed")
++
++        for combo in shard:
++            _check()
++            batch.append(combo)
++            if len(batch) >= batch_size:
++                _check()
++                time.sleep(0.05)  # runs in a worker thread, loop stays free
++                results.extend((c, fn(c)) for c in batch)
++                batch = []
++        if batch:
++            _check()
++            results.extend((c, fn(c)) for c in batch)
++        return results
++
++    monkeypatch.setattr(xpu_mod, "batch_score", slow_batch_score)
++
++    async with Client(mcp) as c:
++        pid = await _plan(c, space={"x": list(range(800)), "y": [1]}, max_cost=100.0, nodes=4)
++        launch_task = asyncio.create_task(
++            c.call_tool("brute_genius_launch", {"plan_id": pid})
++        )
++        # Wait until at least one shard has landed, then kill via the real tool.
++        await _wait_for(lambda: _plans[pid]["combinations_evaluated"] > 0)
++        kill = await c.call_tool("brute_genius_kill", {"plan_id": pid})
++        launched = await launch_task
++
++        assert kill.data["state"] == "killed"
++        assert kill.data["partial_results"] > 0
++        assert kill.data["combinations_evaluated"] > 0
++        assert kill.data["nodes_stopped"] == 4
++        assert launched.data["state"] == "killed"
++        assert launched.data["combinations_evaluated"] < 800
++        assert _plans[pid]["best_so_far"] is not None
++        assert all(n["status"] == "stopped" for n in provider._nodes.values())
++
++        res = await c.call_tool("brute_genius_results", {"plan_id": pid, "top_k": 3})
++        scores = [r["score"] for r in res.data]
++        assert scores == sorted(scores, reverse=True) and len(scores) == 3
++
++
++@pytest.mark.asyncio
++async def test_results_available_between_shards(monkeypatch):
++    """brute_genius_status/results show real data while a run is still live."""
++    gate = {"release": False}
++
++    def gated(shard, fn, device, batch_size=64, plan=None):
++        out = [(c, fn(c)) for c in shard]
++        if plan["shards"] and plan["shards"][-1]["status"] == "running" and not any(
++            s["status"] == "done" for s in plan["shards"]
++        ):
++            pass  # first shard returns immediately
++        else:
++            t0 = time.monotonic()
++            while not gate["release"] and time.monotonic() - t0 < 5:
++                time.sleep(0.005)
++        return out
++
++    monkeypatch.setattr(xpu_mod, "batch_score", gated)
++    async with Client(mcp) as c:
++        pid = await _plan(c, nodes=3)
++        task = asyncio.create_task(c.call_tool("brute_genius_launch", {"plan_id": pid}))
++        await _wait_for(lambda: _plans[pid]["combinations_evaluated"] > 0)
++        st = await c.call_tool("brute_genius_status", {"plan_id": pid})
++        assert st.data["state"] == "running"
++        assert st.data["best_so_far"] is not None
++        live = await c.call_tool("brute_genius_results", {"plan_id": pid, "top_k": 2})
++        assert len(live.data) == 2
++        gate["release"] = True
++        done = await task
++        assert done.data["state"] == "done"
++        assert done.data["combinations_evaluated"] == 27
++
++
++# ─── A6: provisioning rolls back ───────────────────────────────────────────
++
++@pytest.mark.asyncio
++async def test_provisioning_rollback_on_partial_failure(monkeypatch):
++    real = MockProvider.create_instance
++    calls = {"n": 0}
++
++    async def flaky(self, name, chip):
++        calls["n"] += 1
++        if calls["n"] == 3:
++            raise RuntimeError("boom")
++        return await real(self, name, chip)
++
++    monkeypatch.setattr(MockProvider, "create_instance", flaky)
++    async with Client(mcp) as c:
++        pid = await _plan(c, nodes=4)
++        with pytest.raises(Exception) as exc_info:
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert "boom" in str(exc_info.value)
++        assert len(provider._nodes) == 2
++        assert all(n["status"] == "stopped" for n in provider._nodes.values())
++        assert _plans[pid]["state"] == "planned"
++        assert _plans[pid]["shards"] == []
++        assert provider.balance == 25.0  # nothing charged
++
++        # A "planned" plan may be relaunched, starting from clean counters.
++        r = await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert r.data["state"] == "done"
++        assert r.data["combinations_evaluated"] == 27
++        assert len(_plans[pid]["shards"]) == 4
++        assert abs(_spent() - _plans[pid]["est_cost_usd"]) < 1e-9
++
++
++@pytest.mark.asyncio
++async def test_kill_during_provisioning_aborts_launch(monkeypatch):
++    real = MockProvider.create_instance
++    calls = {"n": 0}
++
++    async def kill_midway(self, name, chip):
++        calls["n"] += 1
++        out = await real(self, name, chip)
++        if calls["n"] == 2:
++            for p in _plans.values():
++                p["state"] = "killed"  # what brute_genius_kill does first
++        return out
++
++    monkeypatch.setattr(MockProvider, "create_instance", kill_midway)
++    async with Client(mcp) as c:
++        pid = await _plan(c, nodes=3)
++        with pytest.raises(Exception):
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert _plans[pid]["state"] == "killed"
++        assert all(n["status"] == "stopped" for n in provider._nodes.values())
++        assert provider.balance == 25.0
++
++
++@pytest.mark.asyncio
++async def test_scoring_error_stops_nodes_and_marks_failed():
++    async with Client(mcp) as c:
++        pid = await _plan(c, space={"x": ["not-a-number", "also-not"]}, objective="linear_sum", nodes=2)
++        with pytest.raises(Exception):
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++        assert _plans[pid]["state"] == "failed"
++        assert len(provider._nodes) == 2
++        assert all(n["status"] == "stopped" for n in provider._nodes.values())
++        with pytest.raises(Exception):  # a failed (already charged) plan is not retried
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++
++
++# ─── B5: pricing resource reads the ledger via the async API ───────────────
++
++@pytest.mark.asyncio
++async def test_pricing_resource_async_or_dropped(monkeypatch):
++    async def fake_balance():
++        return 12.5
++
++    monkeypatch.setattr(provider, "get_balance", fake_balance)
++    async with Client(mcp) as c:
++        content = await c.read_resource("brutegenius://pricing")
++        payload = json.loads(content[0].text)
++        assert payload["balance_usd"] == 12.5
++        assert "h100" in payload["rates_usd_per_hour"]
++
++
++# ─── E: small correctness fixes ────────────────────────────────────────────
++
++@pytest.mark.asyncio
++async def test_empty_space_rejected():
++    async with Client(mcp) as c:
++        with pytest.raises(Exception) as exc_info:
++            await _plan(c, space={})
++        assert "at least one axis" in str(exc_info.value).lower()
++        assert len(_plans) == 0
++
++
++@pytest.mark.asyncio
++async def test_launch_uses_chip_device_hints(monkeypatch):
++    assert xpu_mod.CHIP_DEVICE_HINTS["cpu"] == "cpu"
++    assert xpu_mod.CHIP_DEVICE_HINTS["h100"] == "cuda"
++    seen = []
++    real = xpu_mod.pick_device
++
++    def spy(preferred="cuda"):
++        seen.append(preferred)
++        return real(preferred)
++
++    monkeypatch.setattr(xpu_mod, "pick_device", spy)
++    async with Client(mcp) as c:
++        for chip in ("a100", "cpu"):
++            pid = await _plan(c, chip=chip)
++            await c.call_tool("brute_genius_launch", {"plan_id": pid})
++    assert seen == ["cuda", "cpu"]
+diff -ruN -x __pycache__ orig/xpu.py brute-genius/xpu.py
+--- orig/xpu.py	2026-11-01 22:12:46.474635527 +0000
++++ brute-genius/xpu.py	2026-11-01 22:14:08.084381005 +0000
+@@ -1,13 +1,24 @@
+-"""Device-agnostic detection and batch scoring.
++"""Accelerator detection and batch scoring.
+ 
+-Same scoring code runs on CUDA, XPU, MPS, or CPU. The enumerator is cheap;
+-scoring is what the fleet is for.
++Detects available accelerators. Scoring currently runs on the host CPU; the
++device is recorded for logging and future dispatch (see the README Roadmap,
++items C2 and C3).
+ """
+ from __future__ import annotations
+ 
+ import subprocess
+ from typing import Any, Callable, Iterator
+ 
++# Preferred device family for each chip name the providers know about. Used by
++# brute_genius_launch to choose which detected device to record for a run.
++CHIP_DEVICE_HINTS: dict[str, str] = {
++    "h100": "cuda",
++    "a100": "cuda",
++    "l40s": "cuda",
++    "4090": "cuda",
++    "cpu": "cpu",
++}
++
+ 
+ def detect_accelerators() -> dict[str, Any]:
+     """Query nvidia-smi, torch.xpu, and torch.backends.mps.
+@@ -104,9 +115,10 @@
+     """Score a shard in batches, aborting if plan['state'] == 'killed'.
+ 
+     `fn` is a plain callable from the objectives registry — never a string.
+-    The device argument is recorded for logging; the current implementation
+-    runs on the host CPU/GPU that the process already occupies. Real fleet
+-    providers would ship the shard + objective name to remote nodes.
++    The device argument is recorded for logging only: this implementation runs
++    the pure-Python objective on the host CPU, in whatever thread calls it.
++    Vectorised/torch scoring is Roadmap C2; shipping the shard + objective name
++    to remote nodes is Roadmap C3.
+ 
+     Checks plan state per combination (cheap path) and again before every
+     batch evaluation (expensive path), so the worst case after kill() is

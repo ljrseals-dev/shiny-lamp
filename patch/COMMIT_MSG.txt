@@ -1,0 +1,43 @@
+hardening: honest sharding, ledger, and safety re-enforcement
+
+A. Critical correctness
+- A1: add enumerator.combo_at (mixed-radix index decoder); shard() and
+  cartesian() now decode by index. Total work is count(space), not
+  n_shards x count(space) (1000 combos / 4 shards: 4000 -> 1000 decodes).
+- A2: store max_cost_usd in the plan; launch() recomputes cost for the final
+  chip/nodes and refuses above the ceiling before any node exists. Refused
+  overrides leave the plan untouched. plan()/launch() share one _estimate().
+- A3: add GPUProvider.charge(); MockProvider keeps a real ledger and raises on
+  overdraft; RunPodProvider.charge raises NotImplementedError (no silent
+  success). launch() checks balance, then charges the estimate up front.
+- A4: relaunch refused for killed/failed/done plans; a "planned" plan that
+  was rolled back is relaunched from zeroed counters.
+- A5: results/best_so_far/combinations_evaluated update after every shard so
+  status, results and kill report live partials. Scoring now runs in a worker
+  thread (asyncio.to_thread); before this, a blocking batch_score made
+  brute_genius_kill unreachable until the run had already finished.
+- A6: provisioning + charge wrapped in rollback that stops every node created
+  (also on cancellation); plan returns to "planned". Also: a scoring error now
+  stops all nodes and marks the plan "failed" instead of leaking running nodes.
+
+B. Honesty pass
+- B1: README/server docstring/instructions no longer claim a parallel fleet;
+  they describe sequential in-process scoring behind a GPUProvider seam.
+- B2/B3: xpu.py docstrings say scoring runs on the host CPU; cross-reference
+  Roadmap C2/C3.
+- B4: README safety list rewritten to match what is enforced and tested;
+  server.py docstring now describes the charge semantics.
+- B5: pricing resource is async and reads balance via provider.get_balance().
+
+C. README Roadmap added (items C1-C3 plus Later).
+
+E. Small fixes
+- plan() rejects an empty space ({}); plan()/launch() reject unknown chips
+  instead of silently pricing them as h100.
+- _log is now used (rollback, scoring failure, kill failures); silent
+  `except: pass` blocks removed.
+- count() documents its intentional over-cap return.
+- xpu.CHIP_DEVICE_HINTS replaces the chip != "cpu" special case in launch().
+
+Tests: 20 new tests in test_server.py (34 total); vacuous assertion in
+test_plan_refuses_over_max_combinations fixed. No new dependencies.
