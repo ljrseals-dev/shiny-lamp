@@ -1,3 +1,4 @@
+Copyright © 2026 Lewis James Seals Jr. All rights reserved. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 # Brute Genius
 
 Exhaustive combinatorial search as an MCP server. Given a discrete search space, Brute Genius enumerates the full Cartesian product, shards it, scores every combination against a named objective, and returns a ranked list. It does not sample or prune; it tries everything.
