@@ -383,3 +383,101 @@ Until a real LLM execution backend and evaluation objective exist, Brute Genius 
 - [ ] No leaderboard generated from vendor claims or estimator outputs alone.
 
 **Conclusion:** use the mathematics to prune candidates, vendor documentation to establish declared capabilities and constraints, and reproducible execution to establish what actually works. Keep those evidence classes separate throughout the system.
+
+
+## 10. Explicit configuration lifecycle state machine
+
+This lifecycle is the normative gate sequence for a future implementation. It distinguishes pre-download estimates from post-download verification and measured workload eligibility.
+
+```text
+CONFIGURATION CREATED
+   |
+   +-- LICENSE           --> LICENSE_PRUNED
+   +-- COMPATIBILITY     --> COMPATIBILITY_PRUNED
+   +-- PRIVACY/NETWORK   --> PRIVACY_PRUNED
+   |
+HOST IDENTIFICATION
+   +-- unknown           --> HOST_UNRESOLVED
+   |
+STORAGE + MEMORY (estimate)
+   +-- impossible        --> MEMORY_PRUNED
+   +-- estimate ok       --> RESIDENT_ESTIMATE | MAPPED_ESTIMATE
+   |
+DOWNLOAD
+   +-- fetch failed      --> FETCH_FAILED
+   |
+HASH / PROVENANCE
+   +-- mismatch          --> INTEGRITY_QUARANTINED
+   +-- no published hash --> INTEGRITY_UNVERIFIABLE
+   +-- verified          --> re-run memory math with measured size
+                              +-- still fits --> READY_FOR_BENCHMARK
+                              +-- now exceeds --> MEMORY_PRUNED
+   |
+THRESHOLD PROFILE PRESENT
+   +-- absent            --> UNRESOLVED
+   |
+FAN OUT: coding | reasoning | chat | doc-ingest
+   per workload:
+     LOAD_FAILED | HARNESS_FAILED | ACCURACY_FAILED
+     | PERFORMANCE_FAILED | SUSTAINED_LOAD_FAILED
+     | ELIGIBLE (requires LOCAL_MEASURED + thresholds + metrics)
+```
+
+### 10.1 Gate semantics
+
+- **License, compatibility, and privacy/network** are independent hard gates. Their prune states apply to the affected configuration and intended use, not automatically to every quantization or deployment of the model.
+- **Host identification** must complete before hardware feasibility can be decided. Missing OS, memory, accelerator topology, or required storage inputs produce `HOST_UNRESOLVED`; do not substitute a representative tier.
+- **Storage and memory before download** are estimates. Record the estimator version, inputs, assumptions, and evidence class. The result is `RESIDENT_ESTIMATE` or `MAPPED_ESTIMATE`, not a measured fit.
+- **Fetch failure** is distinct from integrity failure. Network errors, timeouts, interrupted transfers, and unavailable sources produce `FETCH_FAILED`; retry policy is separate.
+- **Hash/provenance mismatch** produces `INTEGRITY_QUARANTINED`. Do not load or benchmark the artifact. Preserve the artifact identity, expected hash/source, observed hash, and quarantine reason.
+- **No published expected hash** produces `INTEGRITY_UNVERIFIABLE`, not a hash mismatch. The downloaded bytes can still be hashed locally for identity and repeatability, but a locally computed hash alone does not prove publisher provenance. Project policy must decide whether unverifiable artifacts are blocked or allowed in a clearly marked lower-trust research lane.
+- **Successful integrity verification** triggers a second memory-feasibility calculation using the actual downloaded artifact size and verified format metadata. If the actual size changes the feasibility decision, the configuration is pruned before benchmark execution.
+- **Threshold profile** must exist and be revision-pinned before any benchmark begins. Missing profile means `UNRESOLVED`, not a default threshold or implicit pass.
+- **Workload fan-out** creates independent results for coding, reasoning, chat, and document ingestion. A failure in one workload does not overwrite another workload's outcome.
+
+### 10.2 Workload eligibility requirements
+
+`ELIGIBLE` is a per-workload result and requires all of the following:
+
+1. The exact artifact and configuration passed the required integrity policy.
+2. The benchmark ran locally on the identified host using the recorded runtime/version/backend/flags.
+3. The workload harness completed successfully; otherwise report `HARNESS_FAILED`.
+4. The pre-registered workload and test-set revisions were used.
+5. Required accuracy, latency, throughput, memory, and sustained-load thresholds were met.
+6. Required metrics are present and valid; missing values remain null and cannot satisfy a threshold.
+7. The result is classified `LOCAL_MEASURED` and linked to raw logs or a content-addressed evidence record.
+
+Hosted API measurements must use a distinct evidence class and result path. They cannot satisfy a requirement explicitly marked `LOCAL_MEASURED`. A hosted result may be useful for online comparisons, but must not be represented as a local execution.
+
+### 10.3 Suggested terminal and intermediate states
+
+Configuration-level states:
+
+- `LICENSE_PRUNED`
+- `COMPATIBILITY_PRUNED`
+- `PRIVACY_PRUNED`
+- `HOST_UNRESOLVED`
+- `MEMORY_PRUNED`
+- `RESIDENT_ESTIMATE`
+- `MAPPED_ESTIMATE`
+- `FETCH_FAILED`
+- `INTEGRITY_QUARANTINED`
+- `INTEGRITY_UNVERIFIABLE`
+- `READY_FOR_BENCHMARK`
+- `UNRESOLVED`
+
+Per-workload states:
+
+- `PENDING`
+- `LOAD_FAILED`
+- `HARNESS_FAILED`
+- `ACCURACY_FAILED`
+- `PERFORMANCE_FAILED`
+- `SUSTAINED_LOAD_FAILED`
+- `ELIGIBLE`
+
+Do not encode all workload outcomes into a single configuration terminal state. Preserve the configuration's gate history and the independent workload-result records.
+
+### 10.4 Evidence-class requirement
+
+Use `LOCAL_MEASURED` only when the run was actually executed on the identified local host and the measurement record is complete. Keep it distinct from generic `MEASURED` so that a cloud provider's benchmark cannot be mistaken for a local result. `VENDOR_CLAIM`, `ESTIMATED`, `VERIFIED`, and `UNVERIFIED` remain separate evidence classes and cannot independently produce `ELIGIBLE`.
